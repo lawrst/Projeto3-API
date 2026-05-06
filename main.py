@@ -492,3 +492,10 @@ async def registrar_status_camera(status: StatusCamera, usuario_id: str = Depend
 
     return {"mensagem": "Status da câmera registrado com sucesso!", "alerta": mensagem_alerta}
 
+
+if __name__ == "__main__":
+    import uvicorn
+
+    porta = int(os.getenv("PORT", "10000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=porta)
+
