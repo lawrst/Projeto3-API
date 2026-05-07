@@ -475,7 +475,22 @@ async def websocket_chat(websocket: WebSocket, chat_id: str):
         gerenciador_chat.desconectar(chat_id, websocket)
         await gerenciador_chat.enviar_mensagem_chat(chat_id, f"{nome_usuario} saiu do chat.")
 
-
+@app.delete("/chats/{chat_id}")
+def deletar_chat(chat_id: str, usuario_id: str = Depends(validar_token)):
+    # 1. Garante que só o Admin da empresa pode excluir chats
+    admin = obter_admin_da_empresa(usuario_id)
+    object_id = validar_object_id(chat_id, "ID de chat inválido.")
+    
+    # 2. Deleta todas as mensagens que pertenciam a esse chat para não lotar o banco
+    db["mensagens_chat"].delete_many({"chat_id": chat_id})
+    
+    # 3. Deleta o chat em si
+    resultado = db["chats"].delete_one({"_id": object_id, "empresa_id": admin["empresa_id"]})
+    
+    if resultado.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Chat não encontrado ou você não tem permissão.")
+        
+    return {"mensagem": "Chat e mensagens excluídos com sucesso!"}
 @app.post("/cameras/status")
 async def registrar_status_camera(status: StatusCamera, usuario_id: str = Depends(validar_token)):
     db["status_cameras"].insert_one(
