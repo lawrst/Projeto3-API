@@ -30,8 +30,17 @@ app.add_middleware(
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*", "Authorization", "Content-Type"],
 )
+
+# Middleware para adicionar headers anti-cache
+@app.middleware("http")
+async def add_no_cache_headers(request, call_next):
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 
 def criar_token(usuario_id: str):
@@ -94,6 +103,19 @@ def garantir_acesso_chat(chat_id: str, usuario_id: str):
 @app.get("/")
 def home():
     return {"status": "API online e rodando perfeitamente!"}
+
+
+@app.get("/verificar-token")
+def verificar_token(usuario_id: str = Depends(validar_token)):
+    """Endpoint para verificar se o token é válido"""
+    usuario = buscar_usuario(usuario_id)
+    return {
+        "valido": True,
+        "usuario_id": usuario_id,
+        "nome": usuario.get("nome"),
+        "email": usuario.get("email"),
+        "role": usuario.get("role"),
+    }
 
 
 class UsuarioCadastro(BaseModel):
@@ -378,30 +400,40 @@ gerenciador_chat = GerenciadorDeConexoes()
 
 @app.post("/chat/mensagens", status_code=201)
 async def enviar_mensagem_chat(payload: MensagemChat, usuario_id: str = Depends(validar_token)):
-    chat = garantir_acesso_chat(payload.chat_id, usuario_id)
-    usuario = buscar_usuario(usuario_id)
+    try:
+        chat = garantir_acesso_chat(payload.chat_id, usuario_id)
+        usuario = buscar_usuario(usuario_id)
+    except HTTPException as e:
+        print(f"[ERRO AUTENTICAÇÃO] {e.detail}")
+        raise
+    
     mensagem_limpa = payload.mensagem.strip()
     if not mensagem_limpa:
         raise HTTPException(status_code=400, detail="A mensagem não pode ser vazia.")
 
-    nova_mensagem = {
-        "chat_id": payload.chat_id,
-        "usuario_id": usuario_id,
-        "nome_usuario": usuario["nome"],
-        "mensagem": mensagem_limpa,
-        "data_envio": datetime.utcnow(),
-        "empresa_id": chat["empresa_id"],
-    }
-    resultado = db["mensagens_chat"].insert_one(nova_mensagem)
+    try:
+        nova_mensagem = {
+            "chat_id": payload.chat_id,
+            "usuario_id": usuario_id,
+            "nome_usuario": usuario["nome"],
+            "mensagem": mensagem_limpa,
+            "data_envio": datetime.utcnow(),
+            "empresa_id": chat["empresa_id"],
+        }
+        resultado = db["mensagens_chat"].insert_one(nova_mensagem)
 
-    mensagem_formatada = f"{usuario['nome']}: {mensagem_limpa}"
-    await gerenciador_chat.enviar_mensagem_chat(payload.chat_id, mensagem_formatada)
+        mensagem_formatada = f"{usuario['nome']}: {mensagem_limpa}"
+        await gerenciador_chat.enviar_mensagem_chat(payload.chat_id, mensagem_formatada)
 
-    return {
-        "mensagem": "Mensagem enviada com sucesso!",
-        "id_mensagem": str(resultado.inserted_id),
-        "texto_exibicao": mensagem_formatada,
-    }
+        return {
+            "mensagem": "Mensagem enviada com sucesso!",
+            "id_mensagem": str(resultado.inserted_id),
+            "texto_exibicao": mensagem_formatada,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+    except Exception as e:
+        print(f"[ERRO ENVIO MENSAGEM] {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erro ao enviar mensagem: {str(e)}")
 
 
 @app.get("/chat/mensagens")
@@ -437,6 +469,7 @@ def listar_mensagens_chat(chat_id: str, limite: int = 50, usuario_id: str = Depe
 async def websocket_chat(websocket: WebSocket, chat_id: str):
     token = websocket.query_params.get("token")
     if not token:
+        print(f"[WEBSOCKET ERRO] Sem token para chat {chat_id}")
         await websocket.close(code=1008, reason="Token obrigatório.")
         return
 
@@ -444,8 +477,14 @@ async def websocket_chat(websocket: WebSocket, chat_id: str):
         usuario_id = decodificar_token(token)
         chat = garantir_acesso_chat(chat_id, usuario_id)
         usuario = buscar_usuario(usuario_id)
+        print(f"[WEBSOCKET CONECTADO] Usuário {usuario['nome']} - Chat {chat_id}")
     except HTTPException as erro:
+        print(f"[WEBSOCKET ERRO AUTENTICAÇÃO] {erro.detail}")
         await websocket.close(code=1008, reason=erro.detail)
+        return
+    except Exception as e:
+        print(f"[WEBSOCKET ERRO] {str(e)}")
+        await websocket.close(code=1008, reason=f"Erro: {str(e)}")
         return
 
     await gerenciador_chat.conectar(chat_id, websocket)
@@ -474,6 +513,10 @@ async def websocket_chat(websocket: WebSocket, chat_id: str):
     except WebSocketDisconnect:
         gerenciador_chat.desconectar(chat_id, websocket)
         await gerenciador_chat.enviar_mensagem_chat(chat_id, f"{nome_usuario} saiu do chat.")
+        print(f"[WEBSOCKET DESCONECTADO] {nome_usuario} - Chat {chat_id}")
+    except Exception as e:
+        print(f"[WEBSOCKET ERRO RUNTIME] {str(e)}")
+        gerenciador_chat.desconectar(chat_id, websocket)
 
 @app.delete("/chats/{chat_id}")
 def deletar_chat(chat_id: str, usuario_id: str = Depends(validar_token)):
