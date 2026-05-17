@@ -30,8 +30,17 @@ app.add_middleware(
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*", "Authorization", "Content-Type"],
 )
+
+# Middleware para adicionar headers anti-cache
+@app.middleware("http")
+async def add_no_cache_headers(request, call_next):
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 
 def criar_token(usuario_id: str):
@@ -51,6 +60,27 @@ def decodificar_token(token: str):
         raise HTTPException(status_code=401, detail="Token expirado. Faça login novamente.")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Acesso negado. Token inválido.")
+
+
+def extrair_token_websocket(websocket: WebSocket) -> str | None:
+    """Extrai token JWT do WebSocket em formatos comuns do frontend/proxy."""
+    candidatos = [
+        websocket.query_params.get("token"),
+        websocket.query_params.get("access_token"),
+        websocket.query_params.get("jwt"),
+        websocket.query_params.get("authorization"),
+        websocket.headers.get("authorization"),
+    ]
+
+    for token in candidatos:
+        if not token:
+            continue
+        token_limpo = token.strip().strip('"').strip("'")
+        if token_limpo.lower().startswith("bearer "):
+            token_limpo = token_limpo[7:].strip()
+        if token_limpo:
+            return token_limpo
+    return None
 
 
 def validar_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -94,6 +124,19 @@ def garantir_acesso_chat(chat_id: str, usuario_id: str):
 @app.get("/")
 def home():
     return {"status": "API online e rodando perfeitamente!"}
+
+
+@app.get("/verificar-token")
+def verificar_token(usuario_id: str = Depends(validar_token)):
+    """Endpoint para verificar se o token é válido"""
+    usuario = buscar_usuario(usuario_id)
+    return {
+        "valido": True,
+        "usuario_id": usuario_id,
+        "nome": usuario.get("nome"),
+        "email": usuario.get("email"),
+        "role": usuario.get("role"),
+    }
 
 
 class UsuarioCadastro(BaseModel):
@@ -213,6 +256,7 @@ def login(usuario: UsuarioLogin):
         "mensagem": "Login realizado com sucesso!",
         "token": token_jwt,
         "usuario": usuario_db["nome"],
+        "usuario_id": id_do_usuario,
         "role": usuario_db.get("role", "funcionario"),
         "empresa_id": usuario_db.get("empresa_id"),
     }
@@ -375,33 +419,182 @@ class GerenciadorDeConexoes:
 
 gerenciador_chat = GerenciadorDeConexoes()
 
+import asyncio
+from typing import Any, List, Optional
+
+# Paths configuráveis via .env (usados pelo frontend)
+API_PATH_GALERIA = os.getenv("API_PATH_GALERIA", "/faces/galeria")
+API_PATH_CAMERA_STATUS = os.getenv("API_PATH_CAMERA_STATUS", "/cameras/status")
+API_PATH_ALERTA = os.getenv("API_PATH_ALERTA", "/seguranca/alerta")
+API_PATH_PONTO = os.getenv("API_PATH_PONTO", "/ponto")
+
+# Timeout padrão (em segundos) para operações externas/DB. Força intervalo entre 15 e 45s.
+API_TIMEOUT_SECONDS = int(os.getenv("API_TIMEOUT_SECONDS", "30"))
+if API_TIMEOUT_SECONDS < 15:
+    API_TIMEOUT_SECONDS = 15
+if API_TIMEOUT_SECONDS > 45:
+    API_TIMEOUT_SECONDS = 45
+
+
+class FaceItem(BaseModel):
+    usuario_id: Any
+    nome: str
+    embedding: List[float]
+
+
+class AlertaPayload(BaseModel):
+    motivo: str
+    faces_detectadas: int
+    score: Optional[float] = None
+    usuario_id_reconhecido: Optional[str] = None
+
+
+class PontoPayload(BaseModel):
+    tipo: str
+    score_reconhecimento: Optional[float] = None
+    usuario_id_reconhecido: Optional[str] = None
+
+
+@app.get(API_PATH_GALERIA)
+async def listar_galeria(usuario_id: str = Depends(validar_token)):
+    """Retorna a galeria de faces autorizadas para a empresa do usuário autenticado."""
+    usuario = buscar_usuario(usuario_id)
+    empresa_id = usuario.get("empresa_id")
+
+    try:
+        def _db_query():
+            # busca por empresa se coleção possuir esse campo
+            filtro = {"empresa_id": empresa_id} if empresa_id else {}
+            return list(db["faces"].find(filtro))
+
+        faces_db = await asyncio.wait_for(asyncio.to_thread(_db_query), timeout=API_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Timeout ao buscar galeria de faces.")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Erro interno ao buscar galeria de faces.")
+
+    faces = []
+    for f in faces_db:
+        faces.append({
+            "usuario_id": str(f.get("usuario_id") or f.get("_id")),
+            "nome": f.get("nome"),
+            "embedding": f.get("embedding", []),
+        })
+
+    return {"galeria": faces}
+
+
+@app.post(API_PATH_CAMERA_STATUS)
+async def registrar_status_camera(payload: StatusCamera, usuario_id: str = Depends(validar_token)):
+    usuario = buscar_usuario(usuario_id)
+    empresa_id = usuario.get("empresa_id")
+
+    documento = {
+        "usuario_id": usuario_id,
+        "empresa_id": empresa_id,
+        "status": payload.status,
+        "criado_em": datetime.utcnow(),
+    }
+
+    try:
+        resultado = await asyncio.wait_for(asyncio.to_thread(lambda: db["camera_status"].insert_one(documento)), timeout=API_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Timeout ao registrar status da câmera.")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Erro interno ao registrar status da câmera.")
+
+    return {"ok": True, "id": str(resultado.inserted_id)}
+
+
+@app.post(API_PATH_ALERTA)
+async def registrar_alerta(payload: AlertaPayload, usuario_id: str = Depends(validar_token)):
+    usuario = buscar_usuario(usuario_id)
+    empresa_id = usuario.get("empresa_id")
+
+    documento = {
+        "motivo": payload.motivo,
+        "faces_detectadas": payload.faces_detectadas,
+        "score": payload.score,
+        "usuario_id_reconhecido": payload.usuario_id_reconhecido,
+        "registrado_por": usuario_id,
+        "empresa_id": empresa_id,
+        "criado_em": datetime.utcnow(),
+    }
+
+    try:
+        resultado = await asyncio.wait_for(asyncio.to_thread(lambda: db["alertas"].insert_one(documento)), timeout=API_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Timeout ao registrar alerta de segurança.")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Erro interno ao registrar alerta de segurança.")
+
+    return {"ok": True, "id": str(resultado.inserted_id)}
+
+
+@app.post(API_PATH_PONTO)
+async def registrar_ponto(payload: PontoPayload, usuario_id: str = Depends(validar_token)):
+    usuario = buscar_usuario(usuario_id)
+    empresa_id = usuario.get("empresa_id")
+
+    if payload.tipo not in {"entrada", "saída", "saida"}:
+        raise HTTPException(status_code=400, detail="Tipo de ponto inválido. Use 'entrada' ou 'saída'.")
+
+    documento = {
+        "tipo": payload.tipo,
+        "score_reconhecimento": payload.score_reconhecimento,
+        "usuario_id_reconhecido": payload.usuario_id_reconhecido,
+        "registrado_por": usuario_id,
+        "empresa_id": empresa_id,
+        "criado_em": datetime.utcnow(),
+    }
+
+    try:
+        await asyncio.wait_for(asyncio.to_thread(lambda: db["pontos"].insert_one(documento)), timeout=API_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Timeout ao registrar ponto.")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Erro interno ao registrar ponto.")
+
+    return {"ok": True}
+
+
 
 @app.post("/chat/mensagens", status_code=201)
 async def enviar_mensagem_chat(payload: MensagemChat, usuario_id: str = Depends(validar_token)):
-    chat = garantir_acesso_chat(payload.chat_id, usuario_id)
-    usuario = buscar_usuario(usuario_id)
+    try:
+        chat = garantir_acesso_chat(payload.chat_id, usuario_id)
+        usuario = buscar_usuario(usuario_id)
+    except HTTPException as e:
+        print(f"[ERRO AUTENTICAÇÃO] {e.detail}")
+        raise
+    
     mensagem_limpa = payload.mensagem.strip()
     if not mensagem_limpa:
         raise HTTPException(status_code=400, detail="A mensagem não pode ser vazia.")
 
-    nova_mensagem = {
-        "chat_id": payload.chat_id,
-        "usuario_id": usuario_id,
-        "nome_usuario": usuario["nome"],
-        "mensagem": mensagem_limpa,
-        "data_envio": datetime.utcnow(),
-        "empresa_id": chat["empresa_id"],
-    }
-    resultado = db["mensagens_chat"].insert_one(nova_mensagem)
+    try:
+        nova_mensagem = {
+            "chat_id": payload.chat_id,
+            "usuario_id": usuario_id,
+            "nome_usuario": usuario["nome"],
+            "mensagem": mensagem_limpa,
+            "data_envio": datetime.utcnow(),
+            "empresa_id": chat["empresa_id"],
+        }
+        resultado = db["mensagens_chat"].insert_one(nova_mensagem)
 
-    mensagem_formatada = f"{usuario['nome']}: {mensagem_limpa}"
-    await gerenciador_chat.enviar_mensagem_chat(payload.chat_id, mensagem_formatada)
+        mensagem_formatada = f"{usuario['nome']}: {mensagem_limpa}"
+        await gerenciador_chat.enviar_mensagem_chat(payload.chat_id, mensagem_formatada)
 
-    return {
-        "mensagem": "Mensagem enviada com sucesso!",
-        "id_mensagem": str(resultado.inserted_id),
-        "texto_exibicao": mensagem_formatada,
-    }
+        return {
+            "mensagem": "Mensagem enviada com sucesso!",
+            "id_mensagem": str(resultado.inserted_id),
+            "texto_exibicao": mensagem_formatada,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+    except Exception as e:
+        print(f"[ERRO ENVIO MENSAGEM] {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erro ao enviar mensagem: {str(e)}")
 
 
 @app.get("/chat/mensagens")
@@ -435,8 +628,9 @@ def listar_mensagens_chat(chat_id: str, limite: int = 50, usuario_id: str = Depe
 
 @app.websocket("/ws/chat/{chat_id}")
 async def websocket_chat(websocket: WebSocket, chat_id: str):
-    token = websocket.query_params.get("token")
+    token = extrair_token_websocket(websocket)
     if not token:
+        print(f"[WEBSOCKET ERRO] Sem token para chat {chat_id}")
         await websocket.close(code=1008, reason="Token obrigatório.")
         return
 
@@ -444,8 +638,14 @@ async def websocket_chat(websocket: WebSocket, chat_id: str):
         usuario_id = decodificar_token(token)
         chat = garantir_acesso_chat(chat_id, usuario_id)
         usuario = buscar_usuario(usuario_id)
+        print(f"[WEBSOCKET CONECTADO] Usuário {usuario['nome']} - Chat {chat_id}")
     except HTTPException as erro:
+        print(f"[WEBSOCKET ERRO AUTENTICAÇÃO] {erro.detail}")
         await websocket.close(code=1008, reason=erro.detail)
+        return
+    except Exception as e:
+        print(f"[WEBSOCKET ERRO] {str(e)}")
+        await websocket.close(code=1008, reason=f"Erro: {str(e)}")
         return
 
     await gerenciador_chat.conectar(chat_id, websocket)
@@ -474,6 +674,10 @@ async def websocket_chat(websocket: WebSocket, chat_id: str):
     except WebSocketDisconnect:
         gerenciador_chat.desconectar(chat_id, websocket)
         await gerenciador_chat.enviar_mensagem_chat(chat_id, f"{nome_usuario} saiu do chat.")
+        print(f"[WEBSOCKET DESCONECTADO] {nome_usuario} - Chat {chat_id}")
+    except Exception as e:
+        print(f"[WEBSOCKET ERRO RUNTIME] {str(e)}")
+        gerenciador_chat.desconectar(chat_id, websocket)
 
 @app.delete("/chats/{chat_id}")
 def deletar_chat(chat_id: str, usuario_id: str = Depends(validar_token)):
