@@ -62,6 +62,27 @@ def decodificar_token(token: str):
         raise HTTPException(status_code=401, detail="Acesso negado. Token inválido.")
 
 
+def extrair_token_websocket(websocket: WebSocket) -> str | None:
+    """Extrai token JWT do WebSocket em formatos comuns do frontend/proxy."""
+    candidatos = [
+        websocket.query_params.get("token"),
+        websocket.query_params.get("access_token"),
+        websocket.query_params.get("jwt"),
+        websocket.query_params.get("authorization"),
+        websocket.headers.get("authorization"),
+    ]
+
+    for token in candidatos:
+        if not token:
+            continue
+        token_limpo = token.strip().strip('"').strip("'")
+        if token_limpo.lower().startswith("bearer "):
+            token_limpo = token_limpo[7:].strip()
+        if token_limpo:
+            return token_limpo
+    return None
+
+
 def validar_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     return decodificar_token(credentials.credentials)
 
@@ -235,6 +256,7 @@ def login(usuario: UsuarioLogin):
         "mensagem": "Login realizado com sucesso!",
         "token": token_jwt,
         "usuario": usuario_db["nome"],
+        "usuario_id": id_do_usuario,
         "role": usuario_db.get("role", "funcionario"),
         "empresa_id": usuario_db.get("empresa_id"),
     }
@@ -397,6 +419,145 @@ class GerenciadorDeConexoes:
 
 gerenciador_chat = GerenciadorDeConexoes()
 
+import asyncio
+from typing import Any, List, Optional
+
+# Paths configuráveis via .env (usados pelo frontend)
+API_PATH_GALERIA = os.getenv("API_PATH_GALERIA", "/faces/galeria")
+API_PATH_CAMERA_STATUS = os.getenv("API_PATH_CAMERA_STATUS", "/cameras/status")
+API_PATH_ALERTA = os.getenv("API_PATH_ALERTA", "/seguranca/alerta")
+API_PATH_PONTO = os.getenv("API_PATH_PONTO", "/ponto")
+
+# Timeout padrão (em segundos) para operações externas/DB. Força intervalo entre 15 e 45s.
+API_TIMEOUT_SECONDS = int(os.getenv("API_TIMEOUT_SECONDS", "30"))
+if API_TIMEOUT_SECONDS < 15:
+    API_TIMEOUT_SECONDS = 15
+if API_TIMEOUT_SECONDS > 45:
+    API_TIMEOUT_SECONDS = 45
+
+
+class FaceItem(BaseModel):
+    usuario_id: Any
+    nome: str
+    embedding: List[float]
+
+
+class AlertaPayload(BaseModel):
+    motivo: str
+    faces_detectadas: int
+    score: Optional[float] = None
+    usuario_id_reconhecido: Optional[str] = None
+
+
+class PontoPayload(BaseModel):
+    tipo: str
+    score_reconhecimento: Optional[float] = None
+    usuario_id_reconhecido: Optional[str] = None
+
+
+@app.get(API_PATH_GALERIA)
+async def listar_galeria(usuario_id: str = Depends(validar_token)):
+    """Retorna a galeria de faces autorizadas para a empresa do usuário autenticado."""
+    usuario = buscar_usuario(usuario_id)
+    empresa_id = usuario.get("empresa_id")
+
+    try:
+        def _db_query():
+            # busca por empresa se coleção possuir esse campo
+            filtro = {"empresa_id": empresa_id} if empresa_id else {}
+            return list(db["faces"].find(filtro))
+
+        faces_db = await asyncio.wait_for(asyncio.to_thread(_db_query), timeout=API_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Timeout ao buscar galeria de faces.")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Erro interno ao buscar galeria de faces.")
+
+    faces = []
+    for f in faces_db:
+        faces.append({
+            "usuario_id": str(f.get("usuario_id") or f.get("_id")),
+            "nome": f.get("nome"),
+            "embedding": f.get("embedding", []),
+        })
+
+    return {"galeria": faces}
+
+
+@app.post(API_PATH_CAMERA_STATUS)
+async def registrar_status_camera(payload: StatusCamera, usuario_id: str = Depends(validar_token)):
+    usuario = buscar_usuario(usuario_id)
+    empresa_id = usuario.get("empresa_id")
+
+    documento = {
+        "usuario_id": usuario_id,
+        "empresa_id": empresa_id,
+        "status": payload.status,
+        "criado_em": datetime.utcnow(),
+    }
+
+    try:
+        resultado = await asyncio.wait_for(asyncio.to_thread(lambda: db["camera_status"].insert_one(documento)), timeout=API_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Timeout ao registrar status da câmera.")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Erro interno ao registrar status da câmera.")
+
+    return {"ok": True, "id": str(resultado.inserted_id)}
+
+
+@app.post(API_PATH_ALERTA)
+async def registrar_alerta(payload: AlertaPayload, usuario_id: str = Depends(validar_token)):
+    usuario = buscar_usuario(usuario_id)
+    empresa_id = usuario.get("empresa_id")
+
+    documento = {
+        "motivo": payload.motivo,
+        "faces_detectadas": payload.faces_detectadas,
+        "score": payload.score,
+        "usuario_id_reconhecido": payload.usuario_id_reconhecido,
+        "registrado_por": usuario_id,
+        "empresa_id": empresa_id,
+        "criado_em": datetime.utcnow(),
+    }
+
+    try:
+        resultado = await asyncio.wait_for(asyncio.to_thread(lambda: db["alertas"].insert_one(documento)), timeout=API_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Timeout ao registrar alerta de segurança.")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Erro interno ao registrar alerta de segurança.")
+
+    return {"ok": True, "id": str(resultado.inserted_id)}
+
+
+@app.post(API_PATH_PONTO)
+async def registrar_ponto(payload: PontoPayload, usuario_id: str = Depends(validar_token)):
+    usuario = buscar_usuario(usuario_id)
+    empresa_id = usuario.get("empresa_id")
+
+    if payload.tipo not in {"entrada", "saída", "saida"}:
+        raise HTTPException(status_code=400, detail="Tipo de ponto inválido. Use 'entrada' ou 'saída'.")
+
+    documento = {
+        "tipo": payload.tipo,
+        "score_reconhecimento": payload.score_reconhecimento,
+        "usuario_id_reconhecido": payload.usuario_id_reconhecido,
+        "registrado_por": usuario_id,
+        "empresa_id": empresa_id,
+        "criado_em": datetime.utcnow(),
+    }
+
+    try:
+        await asyncio.wait_for(asyncio.to_thread(lambda: db["pontos"].insert_one(documento)), timeout=API_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Timeout ao registrar ponto.")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Erro interno ao registrar ponto.")
+
+    return {"ok": True}
+
+
 
 @app.post("/chat/mensagens", status_code=201)
 async def enviar_mensagem_chat(payload: MensagemChat, usuario_id: str = Depends(validar_token)):
@@ -467,7 +628,7 @@ def listar_mensagens_chat(chat_id: str, limite: int = 50, usuario_id: str = Depe
 
 @app.websocket("/ws/chat/{chat_id}")
 async def websocket_chat(websocket: WebSocket, chat_id: str):
-    token = websocket.query_params.get("token")
+    token = extrair_token_websocket(websocket)
     if not token:
         print(f"[WEBSOCKET ERRO] Sem token para chat {chat_id}")
         await websocket.close(code=1008, reason="Token obrigatório.")
