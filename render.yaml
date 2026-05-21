@@ -3,6 +3,6 @@ services:
     name: projeto3-api
     env: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: CMAKE_BUILD_PARALLEL_LEVEL=1 pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /
