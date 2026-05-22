@@ -13,6 +13,7 @@ RUN apt-get update \
        build-essential \
        cmake \
        pkg-config \
+             git \
        libopenblas-dev \
        liblapack-dev \
        libatlas-base-dev \
@@ -30,8 +31,8 @@ RUN python -m pip install --upgrade pip setuptools wheel \
 # Copy source
 COPY . /app
 
-EXPOSE 10000
+EXPOSE 7860
 
-ENV PORT=10000
+ENV PORT=7860
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "${PORT}"]
+CMD sh -c "exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-7860}"

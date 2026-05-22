@@ -1,23 +1,16 @@
 import os
 from datetime import datetime, timedelta
-from io import BytesIO
-import base64
 import asyncio
 from typing import Any, List, Optional
 
 import jwt
-import face_recognition
-import cv2
-import numpy as np
 from bson.objectid import ObjectId
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from passlib.context import CryptContext
 from pydantic import BaseModel
-from PIL import Image
-
 from database import db
 
 load_dotenv()
@@ -483,83 +476,14 @@ class PontoPayload(BaseModel):
 
 
 class CadastrarRostoPayload(BaseModel):
-    """Payload para registrar rosto do usuário"""
-    imagem_base64: str
+    """Payload para registrar rosto do usuário vindo do Desktop"""
+    embedding: list[float] 
 
 
 class VerificarRostoPayload(BaseModel):
     """Payload para verificar um rosto contra a galeria"""
     imagem_base64: str
     limiar_confianca: float = 0.6
-
-
-class RegistroPontoComRostoPayload(BaseModel):
-    """Payload para registrar ponto com reconhecimento facial"""
-    tipo: str  # "entrada" ou "saída"
-    imagem_base64: str
-    limiar_confianca: float = 0.6
-
-
-# Funções auxiliares para reconhecimento facial
-def extrair_embedding_de_imagem(imagem_bytes: bytes) -> Optional[np.ndarray]:
-    """Extrai embedding facial de uma imagem em bytes. Retorna None se nenhuma face for detectada."""
-    try:
-        imagem_np = np.frombuffer(imagem_bytes, np.uint8)
-        imagem_cv = cv2.imdecode(imagem_np, cv2.IMREAD_COLOR)
-        if imagem_cv is None:
-            return None
-        
-        # Converter de BGR para RGB
-        imagem_rgb = cv2.cvtColor(imagem_cv, cv2.COLOR_BGR2RGB)
-        
-        # Detectar faces e extrair embeddings
-        encodings = face_recognition.face_encodings(imagem_rgb)
-        
-        if len(encodings) == 0:
-            return None
-        
-        # Retornar o primeiro encoding encontrado
-        return encodings[0]
-    except Exception as e:
-        print(f"[ERRO EMBEDDING] {str(e)}")
-        return None
-
-
-def converter_base64_para_bytes(imagem_base64: str) -> Optional[bytes]:
-    """Converte string base64 para bytes."""
-    try:
-        # Remover prefixo data:image se existir
-        if imagem_base64.startswith("data:image"):
-            imagem_base64 = imagem_base64.split(",")[1]
-        return base64.b64decode(imagem_base64)
-    except Exception as e:
-        print(f"[ERRO DECODIFICACAO BASE64] {str(e)}")
-        return None
-
-
-def comparar_faces(embedding_capturado: np.ndarray, embeddings_galeria: List[List[float]]) -> tuple[Optional[str], float]:
-    """
-    Compara embedding capturado com galeria de rostos.
-    Retorna (usuario_id ou None, maior_confianca).
-    Confiança varia de 0 (idêntico) a 1 (completamente diferente).
-    """
-    if not embeddings_galeria or len(embeddings_galeria) == 0:
-        return None, 1.0
-    
-    try:
-        distancias = face_recognition.face_distance(embeddings_galeria, embedding_capturado)
-        
-        if len(distancias) == 0:
-            return None, 1.0
-        
-        # Encontrar o melhor match (menor distância = maior confiança)
-        indice_melhor = np.argmin(distancias)
-        confianca_em_distancia = distancias[indice_melhor]
-        
-        return indice_melhor, confianca_em_distancia
-    except Exception as e:
-        print(f"[ERRO COMPARACAO FACES] {str(e)}")
-        return None, 1.0
 
 
 @app.get(API_PATH_GALERIA)
@@ -933,285 +857,41 @@ async def registrar_status_camera(status: StatusCamera, usuario_id: str = Depend
 
 @app.post("/rosto/cadastrar", status_code=201)
 async def cadastrar_rosto_usuario(payload: CadastrarRostoPayload, usuario_id: str = Depends(validar_token)):
-    """
-    Cadastra o rosto do usuário a partir de uma imagem em base64.
-    Armazena apenas um embedding por usuário (atualiza se já existir).
-    """
     usuario = buscar_usuario(usuario_id)
     empresa_id = usuario.get("empresa_id")
-    
-    # Converter base64 para bytes
-    imagem_bytes = converter_base64_para_bytes(payload.imagem_base64)
-    if not imagem_bytes:
-        raise HTTPException(status_code=400, detail="Falha ao decodificar imagem. Verifique o formato base64.")
-    
-    # Extrair embedding
-    embedding = extrair_embedding_de_imagem(imagem_bytes)
-    if embedding is None:
-        raise HTTPException(status_code=400, detail="Nenhuma face detectada na imagem. Tente novamente com uma foto mais clara.")
-    
-    # Converter embedding numpy para lista para salvar no MongoDB
-    embedding_lista = embedding.tolist()
-    
+
     try:
-        # Verificar se usuário já tem rosto registrado
         rosto_existente = db["rostos_registrados"].find_one({"usuario_id": usuario_id})
         
         if rosto_existente:
-            # Atualizar embedding existente
             db["rostos_registrados"].update_one(
                 {"usuario_id": usuario_id},
                 {
                     "$set": {
-                        "embedding": embedding_lista,
-                        "nome": usuario["nome"],
-                        "email": usuario["email"],
-                        "empresa_id": empresa_id,
+                        "embedding": payload.embedding,
                         "atualizado_em": datetime.utcnow(),
                     }
-                },
-            )
-            mensagem = "Rosto cadastrado/atualizado com sucesso!"
-        else:
-            # Criar novo registro
-            resultado = db["rostos_registrados"].insert_one(
-                {
-                    "usuario_id": usuario_id,
-                    "nome": usuario["nome"],
-                    "email": usuario["email"],
-                    "empresa_id": empresa_id,
-                    "embedding": embedding_lista,
-                    "criado_em": datetime.utcnow(),
-                    "atualizado_em": datetime.utcnow(),
                 }
             )
+            mensagem = "Rosto atualizado com sucesso!"
+        else:
+            db["rostos_registrados"].insert_one({
+                "usuario_id": usuario_id,
+                "nome": usuario["nome"],
+                "empresa_id": empresa_id,
+                "embedding": payload.embedding,
+                "criado_em": datetime.utcnow()
+            })
             mensagem = "Rosto cadastrado com sucesso!"
         
-        return {
-            "mensagem": mensagem,
-            "usuario_id": usuario_id,
-            "nome_usuario": usuario["nome"],
-        }
+        return {"mensagem": mensagem}
     except Exception as e:
-        print(f"[ERRO CADASTRO ROSTO] {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erro ao cadastrar rosto: {str(e)}")
-
-
-@app.post("/rosto/verificar")
-async def verificar_rosto(payload: VerificarRostoPayload, usuario_id: str = Depends(validar_token)):
-    """
-    Verifica um rosto capturado contra a galeria de rostos da empresa.
-    Retorna o usuário identificado (se confiança acima do limiar) e score de confiança.
-    """
-    usuario = buscar_usuario(usuario_id)
-    empresa_id = usuario.get("empresa_id")
-    
-    # Converter base64 para bytes
-    imagem_bytes = converter_base64_para_bytes(payload.imagem_base64)
-    if not imagem_bytes:
-        raise HTTPException(status_code=400, detail="Falha ao decodificar imagem. Verifique o formato base64.")
-    
-    # Extrair embedding da imagem capturada
-    embedding_capturado = extrair_embedding_de_imagem(imagem_bytes)
-    if embedding_capturado is None:
-        raise HTTPException(status_code=400, detail="Nenhuma face detectada na imagem capturada.")
-    
-    try:
-        # Buscar rostos registrados da empresa
-        rostos_empresa = list(db["rostos_registrados"].find({"empresa_id": empresa_id}))
-        
-        if not rostos_empresa:
-            return {
-                "identificado": False,
-                "confianca": 1.0,
-                "mensagem": "Nenhum rosto registrado na empresa.",
-                "usuario_identificado": None,
-            }
-        
-        # Preparar lista de embeddings e mapeamento de índices
-        embeddings_galeria = [np.array(rosto["embedding"]) for rosto in rostos_empresa]
-        
-        # Comparar faces
-        indice, distancia = comparar_faces(embedding_capturado, embeddings_galeria)
-        
-        # Converter distância para confiança (0 = idêntico, 1 = diferente)
-        # Considerar match se distância < limiar (padrão 0.6)
-        confianca = float(distancia)
-        identificado = confianca <= payload.limiar_confianca
-        
-        resultado = {
-            "identificado": identificado,
-            "confianca": confianca,
-            "limiar_utilizado": payload.limiar_confianca,
-            "usuario_identificado": None,
-            "nome_usuario": None,
-        }
-        
-        if identificado and indice is not None:
-            rosto_match = rostos_empresa[indice]
-            resultado["usuario_identificado"] = rosto_match["usuario_id"]
-            resultado["nome_usuario"] = rosto_match["nome"]
-        
-        return resultado
-    except Exception as e:
-        print(f"[ERRO VERIFICACAO ROSTO] {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erro ao verificar rosto: {str(e)}")
-
-
-@app.post("/ponto/com-rosto", status_code=201)
-async def registrar_ponto_com_rosto(
-    payload: RegistroPontoComRostoPayload,
-    usuario_id: str = Depends(validar_token),
-):
-    """
-    Registra ponto de entrada/saída com verificação de reconhecimento facial.
-    Valida se a face capturada corresponde ao usuário autenticado.
-    """
-    usuario = buscar_usuario(usuario_id)
-    empresa_id = usuario.get("empresa_id")
-    
-    if payload.tipo not in {"entrada", "saída", "saida"}:
-        raise HTTPException(status_code=400, detail="Tipo de ponto inválido. Use 'entrada' ou 'saída'.")
-    
-    # Converter base64 para bytes
-    imagem_bytes = converter_base64_para_bytes(payload.imagem_base64)
-    if not imagem_bytes:
-        raise HTTPException(status_code=400, detail="Falha ao decodificar imagem. Verifique o formato base64.")
-    
-    # Extrair embedding da imagem capturada
-    embedding_capturado = extrair_embedding_de_imagem(imagem_bytes)
-    if embedding_capturado is None:
-        raise HTTPException(status_code=400, detail="Nenhuma face detectada na imagem capturada.")
-    
-    try:
-        # Buscar rosto registrado do usuário autenticado
-        rosto_usuario = db["rostos_registrados"].find_one({"usuario_id": usuario_id})
-        
-        if not rosto_usuario:
-            raise HTTPException(
-                status_code=404,
-                detail="Usuário não tem rosto cadastrado. Cadastre primeiro em /rosto/cadastrar"
-            )
-        
-        # Comparar com o rosto registrado do usuário
-        embedding_registrado = np.array(rosto_usuario["embedding"])
-        distancia = face_recognition.face_distance([embedding_registrado], embedding_capturado)[0]
-        
-        confianca = float(distancia)
-        
-        # Validar confiança
-        if confianca > payload.limiar_confianca:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Rosto não corresponde ao usuário autenticado. Confiança: {confianca:.3f} (limiar: {payload.limiar_confianca})"
-            )
-        
-        # Registrar ponto
-        documento_ponto = {
-            "tipo": payload.tipo,
-            "usuario_id": usuario_id,
-            "nome_usuario": usuario["nome"],
-            "empresa_id": empresa_id,
-            "confianca_facial": confianca,
-            "criado_em": datetime.utcnow(),
-        }
-        
-        resultado = db["pontos"].insert_one(documento_ponto)
-        
-        return {
-            "mensagem": "Ponto registrado com sucesso!",
-            "tipo": payload.tipo,
-            "usuario": usuario["nome"],
-            "confianca_facial": confianca,
-            "timestamp": datetime.utcnow().isoformat(),
-            "id_registro": str(resultado.inserted_id),
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[ERRO REGISTRO PONTO COM ROSTO] {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erro ao registrar ponto: {str(e)}")
-
-
-@app.post("/seguranca/detectar-intruso")
-async def detectar_intruso(payload: VerificarRostoPayload):
-    """
-    Sistema de segurança: detecta se a pessoa capturada é um usuário conhecido.
-    Usado para alertar sobre estranhos no ambiente.
-    NÃO requer autenticação (para que câmeras de segurança possam usar).
-    """
-    # Converter base64 para bytes
-    imagem_bytes = converter_base64_para_bytes(payload.imagem_base64)
-    if not imagem_bytes:
-        raise HTTPException(status_code=400, detail="Falha ao decodificar imagem. Verifique o formato base64.")
-    
-    # Extrair embedding da imagem capturada
-    embedding_capturado = extrair_embedding_de_imagem(imagem_bytes)
-    if embedding_capturado is None:
-        return {
-            "eh_intruso": True,
-            "confianca": 1.0,
-            "mensagem": "Nenhuma face detectada. Sistema de segurança ativado!",
-            "usuario_identificado": None,
-        }
-    
-    try:
-        # Buscar todos os rostos registrados
-        todos_rostos = list(db["rostos_registrados"].find({}))
-        
-        if not todos_rostos:
-            return {
-                "eh_intruso": True,
-                "confianca": 1.0,
-                "mensagem": "Nenhum usuário registrado no sistema.",
-                "usuario_identificado": None,
-            }
-        
-        # Preparar lista de embeddings
-        embeddings_galeria = [np.array(rosto["embedding"]) for rosto in todos_rostos]
-        
-        # Comparar faces
-        indice, distancia = comparar_faces(embedding_capturado, embeddings_galeria)
-        
-        confianca = float(distancia)
-        eh_intruso = confianca > payload.limiar_confianca
-        
-        resultado = {
-            "eh_intruso": eh_intruso,
-            "confianca": confianca,
-            "limiar_utilizado": payload.limiar_confianca,
-            "usuario_identificado": None,
-            "nome_usuario": None,
-        }
-        
-        if not eh_intruso and indice is not None:
-            rosto_match = todos_rostos[indice]
-            resultado["usuario_identificado"] = rosto_match["usuario_id"]
-            resultado["nome_usuario"] = rosto_match["nome"]
-            resultado["mensagem"] = f"Usuário autorizado identificado: {rosto_match['nome']}"
-        else:
-            resultado["mensagem"] = "⚠️ ALERTA: ESTRANHO DETECTADO! Pessoa desconhecida no ambiente."
-        
-        # Registrar alerta se for intruso
-        if eh_intruso:
-            db["alertas_seguranca"].insert_one(
-                {
-                    "tipo": "deteccao_intruso",
-                    "confianca": confianca,
-                    "criado_em": datetime.utcnow(),
-                    "estado": "ativo",
-                }
-            )
-        
-        return resultado
-    except Exception as e:
-        print(f"[ERRO DETECCAO INTRUSO] {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erro ao detectar intruso: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erro ao salvar no banco: {str(e)}")
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    porta = int(os.getenv("PORT", "10000"))
+    porta = int(os.getenv("PORT", "7860"))
     uvicorn.run("main:app", host="0.0.0.0", port=porta)
 
