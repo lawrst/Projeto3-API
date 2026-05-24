@@ -27,29 +27,51 @@ security_opcional = HTTPBearer(auto_error=False)
 
 app = FastAPI(title="API - VERIFIQ OS", description="Motor principal do sistema de gestão e segurança.")
 
-# Configuração de CORS
+# Configuração de CORS extremamente permissiva para evitar bloqueios
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://verifiq.onrender.com", 
-        "http://localhost:5500", 
-        "http://127.0.0.1:5500",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000"
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+@app.get("/debug-db")
+def debug_db():
+    """Endpoint para testar a conexão com o banco de dados"""
+    try:
+        from database import client
+        client.admin.command('ping')
+        return {"status": "Conexão com MongoDB Atlas OK!"}
+    except Exception as e:
+        return {"status": "Erro na conexão com MongoDB", "detalhe": str(e)}
+
 # Middleware para adicionar headers anti-cache
 @app.middleware("http")
 async def add_no_cache_headers(request, call_next):
-    response = await call_next(request)
-    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-    response.headers["Pragma"] = "no-cache"
-    response.headers["Expires"] = "0"
-    return response
+    try:
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
+    except Exception as e:
+        # Se der erro, o FastAPI já vai tratar no exception handler, 
+        # mas precisamos garantir que o erro suba se não quisermos tratá-lo aqui
+        raise e
+
+@app.exception_handler(Exception)
+async def custom_exception_handler(request, exc):
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Erro interno do servidor", "msg": str(exc)},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
 
 
 def criar_token(usuario_id: str):
