@@ -12,6 +12,13 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from passlib.context import CryptContext
 from pydantic import BaseModel
 from database import db
+import bcrypt
+
+# Solução para erro de compatibilidade entre passlib e bcrypt >= 4.0.0
+if not hasattr(bcrypt, "__about__"):
+    class BcryptAbout:
+        __version__ = getattr(bcrypt, "__version__", "4.0.1")
+    bcrypt.__about__ = BcryptAbout()
 
 load_dotenv()
 
@@ -240,14 +247,14 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
 def gerar_hash_senha(senha: str):
-    return pwd_context.hash(senha)
+    """Gera hash da senha, limitando a 72 caracteres para compatibilidade com Bcrypt."""
+    return pwd_context.hash(senha[:72])
 
 
 def verificar_senha(senha_plana: str, senha_hash: str):
+    """Verifica a senha, limitando a 72 caracteres para compatibilidade com Bcrypt."""
     try:
-        # Bcrypt tem um limite de 72 bytes. Vamos truncar preventivamente para evitar o erro 500.
-        senha_truncada = senha_plana.encode('utf-8')[:72]
-        return pwd_context.verify(senha_truncada, senha_hash)
+        return pwd_context.verify(senha_plana[:72], senha_hash)
     except Exception as e:
         print(f"Erro na verificação do Bcrypt: {e}")
         return False
@@ -258,8 +265,6 @@ def cadastrar_usuario(
     usuario: UsuarioCadastro,
     credentials: HTTPAuthorizationCredentials | None = Depends(security_opcional),
 ):
-    # Truncar a senha no cadastro também para manter consistência
-    senha_hash = gerar_hash_senha(usuario.senha.encode('utf-8')[:72])
     total_usuarios = db["usuarios"].count_documents({})
     admin_autenticado = None
 
