@@ -15,9 +15,9 @@ from database import db
 
 load_dotenv()
 
-SECRET_KEY = os.getenv("JWT_SECRET_KEY")
-if not SECRET_KEY:
-    raise ValueError("Aviso Crítico: JWT_SECRET_KEY não foi encontrada no arquivo .env!")
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "chave-padrao-temporaria")
+if os.getenv("JWT_SECRET_KEY") is None:
+    print("AVISO: JWT_SECRET_KEY não encontrada no .env. Usando chave padrão!")
 
 ALGORITHM = "HS256"
 TOKEN_EXPIRACAO_MINUTOS = 60 * 8
@@ -63,9 +63,20 @@ async def add_no_cache_headers(request, call_next):
 @app.exception_handler(Exception)
 async def custom_exception_handler(request, exc):
     from fastapi.responses import JSONResponse
+    import traceback
+    
+    # Log do erro no servidor (Render logs)
+    print("--- ERRO CAPTURADO ---")
+    print(traceback.format_exc())
+    print("----------------------")
+    
     return JSONResponse(
         status_code=500,
-        content={"detail": "Erro interno do servidor", "msg": str(exc)},
+        content={
+            "detail": "Erro interno do servidor", 
+            "error_type": type(exc).__name__,
+            "error_msg": str(exc)
+        },
         headers={
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "*",
@@ -282,22 +293,42 @@ def cadastrar_usuario(
 
 @app.post("/login")
 def login(usuario: UsuarioLogin):
-    usuario_db = db["usuarios"].find_one({"email": usuario.email})
-    if not usuario_db or not verificar_senha(usuario.senha, usuario_db["senha"]):
-        raise HTTPException(status_code=401, detail="E-mail ou senha incorretos.")
+    try:
+        if db is None:
+            raise HTTPException(status_code=500, detail="Banco de dados não conectado.")
+            
+        usuario_db = db["usuarios"].find_one({"email": usuario.email})
+        
+        if not usuario_db:
+            raise HTTPException(status_code=401, detail="E-mail ou senha incorretos.")
 
-    id_do_usuario = str(usuario_db["_id"])
-    token_jwt = criar_token(id_do_usuario)
-    tem_rosto = usuario_tem_rosto_cadastrado(id_do_usuario)
-    return {
-        "mensagem": "Login realizado com sucesso!",
-        "token": token_jwt,
-        "usuario": usuario_db["nome"],
-        "usuario_id": id_do_usuario,
-        "role": usuario_db.get("role", "funcionario"),
-        "empresa_id": usuario_db.get("empresa_id"),
-        "tem_rosto": tem_rosto,
-    }
+        try:
+            senha_valida = verificar_senha(usuario.senha, usuario_db.get("senha", ""))
+        except Exception as e:
+            print(f"Erro ao verificar senha: {e}")
+            raise HTTPException(status_code=500, detail=f"Erro na verificação de senha: {str(e)}")
+
+        if not senha_valida:
+            raise HTTPException(status_code=401, detail="E-mail ou senha incorretos.")
+
+        id_do_usuario = str(usuario_db["_id"])
+        token_jwt = criar_token(id_do_usuario)
+        tem_rosto = usuario_tem_rosto_cadastrado(id_do_usuario)
+        
+        return {
+            "mensagem": "Login realizado com sucesso!",
+            "token": token_jwt,
+            "usuario": usuario_db.get("nome", "Usuário"),
+            "usuario_id": id_do_usuario,
+            "role": usuario_db.get("role", "funcionario"),
+            "empresa_id": usuario_db.get("empresa_id"),
+            "tem_rosto": tem_rosto,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Erro interno no login: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro interno no servidor: {str(e)}")
 
 
 @app.get("/empresa/funcionarios")
