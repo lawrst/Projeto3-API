@@ -244,7 +244,13 @@ def gerar_hash_senha(senha: str):
 
 
 def verificar_senha(senha_plana: str, senha_hash: str):
-    return pwd_context.verify(senha_plana, senha_hash)
+    try:
+        # Bcrypt tem um limite de 72 bytes. Vamos truncar preventivamente para evitar o erro 500.
+        senha_truncada = senha_plana.encode('utf-8')[:72]
+        return pwd_context.verify(senha_truncada, senha_hash)
+    except Exception as e:
+        print(f"Erro na verificação do Bcrypt: {e}")
+        return False
 
 
 @app.post("/cadastro", status_code=201)
@@ -252,6 +258,8 @@ def cadastrar_usuario(
     usuario: UsuarioCadastro,
     credentials: HTTPAuthorizationCredentials | None = Depends(security_opcional),
 ):
+    # Truncar a senha no cadastro também para manter consistência
+    senha_hash = gerar_hash_senha(usuario.senha.encode('utf-8')[:72])
     total_usuarios = db["usuarios"].count_documents({})
     admin_autenticado = None
 
