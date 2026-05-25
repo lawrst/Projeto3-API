@@ -9,16 +9,9 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from passlib.context import CryptContext
 from pydantic import BaseModel
 from database import db
 import bcrypt
-
-# Solução para erro de compatibilidade entre passlib e bcrypt >= 4.0.0
-if not hasattr(bcrypt, "__about__"):
-    class BcryptAbout:
-        __version__ = getattr(bcrypt, "__version__", "4.0.1")
-    bcrypt.__about__ = BcryptAbout()
 
 load_dotenv()
 
@@ -243,20 +236,23 @@ class MensagemChat(BaseModel):
     mensagem: str
 
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+def gerar_hash_senha(senha: str) -> str:
+    """Gera hash da senha usando bcrypt diretamente, garantindo limite de 72 bytes."""
+    senha_bytes = senha.encode('utf-8')[:72]
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(senha_bytes, salt).decode('utf-8')
 
 
-def gerar_hash_senha(senha: str):
-    """Gera hash da senha, limitando a 72 caracteres para compatibilidade com Bcrypt."""
-    return pwd_context.hash(senha[:72])
-
-
-def verificar_senha(senha_plana: str, senha_hash: str):
-    """Verifica a senha, limitando a 72 caracteres para compatibilidade com Bcrypt."""
+def verificar_senha(senha_plana: str, senha_hash: str) -> bool:
+    """Verifica a senha usando bcrypt diretamente, garantindo limite de 72 bytes."""
     try:
-        return pwd_context.verify(senha_plana[:72], senha_hash)
+        if not senha_hash:
+            return False
+        senha_plana_bytes = senha_plana.encode('utf-8')[:72]
+        senha_hash_bytes = senha_hash.encode('utf-8')
+        return bcrypt.checkpw(senha_plana_bytes, senha_hash_bytes)
     except Exception as e:
-        print(f"Erro na verificação do Bcrypt: {e}")
+        print(f"Erro na verificação do Bcrypt manual: {e}")
         return False
 
 
