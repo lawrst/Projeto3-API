@@ -1,4 +1,5 @@
 import os
+import uuid
 from datetime import datetime, timedelta
 import asyncio
 from typing import Any, List, Optional
@@ -21,6 +22,8 @@ if os.getenv("JWT_SECRET_KEY") is None:
 
 ALGORITHM = "HS256"
 TOKEN_EXPIRACAO_MINUTOS = 60 * 8
+DEVICE_TOKEN_EXPIRACAO_MINUTOS = 60 * 8
+DEVICE_HEARTBEAT_TIMEOUT_SECONDS = 75
 ROLES_VALIDOS = {"admin", "funcionario"}
 security = HTTPBearer()
 security_opcional = HTTPBearer(auto_error=False)
@@ -91,6 +94,18 @@ def criar_token(usuario_id: str):
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 
+def criar_token_dispositivo(device_id: str, usuario_id: str, token_version: int):
+    exp = datetime.utcnow() + timedelta(minutes=DEVICE_TOKEN_EXPIRACAO_MINUTOS)
+    payload = {
+        "device_id": device_id,
+        "usuario_id": usuario_id,
+        "token_type": "device",
+        "token_version": token_version,
+        "exp": exp,
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
 def decodificar_token(token: str):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -102,6 +117,24 @@ def decodificar_token(token: str):
         raise HTTPException(status_code=401, detail="Token expirado. Faça login novamente.")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Acesso negado. Token inválido.")
+
+
+def decodificar_token_dispositivo(token: str):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("token_type") != "device":
+            raise HTTPException(status_code=401, detail="Token do dispositivo inválido.")
+
+        device_id = payload.get("device_id")
+        usuario_id = payload.get("usuario_id")
+        if not device_id or not usuario_id:
+            raise HTTPException(status_code=401, detail="Token do dispositivo incompleto.")
+
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token do dispositivo expirado. Renove o vínculo.")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Acesso negado. Token do dispositivo inválido.")
 
 
 def extrair_token_websocket(websocket: WebSocket) -> str | None:
@@ -129,10 +162,172 @@ def validar_token(credentials: HTTPAuthorizationCredentials = Depends(security))
     return decodificar_token(credentials.credentials)
 
 
+def validar_token_dispositivo(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    payload = decodificar_token_dispositivo(credentials.credentials)
+    dispositivo = db["desktop_devices"].find_one(
+        {"device_id": payload["device_id"], "usuario_id": payload["usuario_id"]}
+    )
+    if not dispositivo:
+        raise HTTPException(status_code=401, detail="Dispositivo não encontrado.")
+
+    if int(dispositivo.get("token_version", 0)) != int(payload.get("token_version", -1)):
+        raise HTTPException(status_code=401, detail="Token do dispositivo desatualizado.")
+
+    return payload
+
+
 def validar_object_id(object_id: str, detalhe_erro: str):
     if not ObjectId.is_valid(object_id):
         raise HTTPException(status_code=400, detail=detalhe_erro)
     return ObjectId(object_id)
+
+
+def _to_datetime(valor: Any) -> Optional[datetime]:
+    if isinstance(valor, datetime):
+        return valor
+    if isinstance(valor, str):
+        texto = valor.strip()
+        if not texto:
+            return None
+        try:
+            if texto.endswith("Z"):
+                texto = texto[:-1] + "+00:00"
+            return datetime.fromisoformat(texto)
+        except ValueError:
+            return None
+    return None
+
+
+def _esta_online(ultimo_heartbeat: Any) -> bool:
+    instante = _to_datetime(ultimo_heartbeat)
+    if not instante:
+        return False
+    return (datetime.utcnow() - instante.replace(tzinfo=None)).total_seconds() <= DEVICE_HEARTBEAT_TIMEOUT_SECONDS
+
+
+def _novo_device_id() -> str:
+    return uuid.uuid4().hex
+
+
+def buscar_dispositivo_do_usuario(usuario_id: str):
+    dispositivo = db["desktop_devices"].find_one({"usuario_id": usuario_id})
+    return dispositivo if isinstance(dispositivo, dict) else None
+
+
+def _serializar_dispositivo(dispositivo: Optional[dict[str, Any]]) -> dict[str, Any]:
+    if not isinstance(dispositivo, dict) or not dispositivo:
+        return {
+            "pareado": False,
+            "dispositivo": None,
+            "conectado": False,
+            "monitorando": False,
+            "estado": "desconectado",
+            "ultimo_heartbeat_em": None,
+        }
+
+    online = _esta_online(dispositivo.get("last_heartbeat_at"))
+    monitoring_state = str(dispositivo.get("monitoring_state") or "idle").strip().lower()
+    monitorando = online and monitoring_state in {"monitoring", "on", "ativo", "active"}
+    estado = "monitorando" if monitorando else ("conectado" if online else "desconectado")
+
+    return {
+        "pareado": True,
+        "dispositivo": {
+            "device_id": dispositivo.get("device_id"),
+            "device_name": dispositivo.get("device_name") or dispositivo.get("hostname"),
+            "hostname": dispositivo.get("hostname"),
+            "machine": dispositivo.get("machine"),
+            "os_name": dispositivo.get("os_name"),
+            "agent_version": dispositivo.get("agent_version"),
+        },
+        "conectado": online,
+        "monitorando": monitorando,
+        "estado": estado,
+        "ultimo_heartbeat_em": _iso_or_none(_to_datetime(dispositivo.get("last_heartbeat_at"))),
+        "ultimo_comando_em": _iso_or_none(_to_datetime(dispositivo.get("last_command_at"))),
+        "token_expires_em": _iso_or_none(_to_datetime(dispositivo.get("token_expires_at"))),
+    }
+
+
+def _gerar_comando(device_id: str, usuario_id: str, acao: str, payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    return {
+        "command_id": uuid.uuid4().hex,
+        "device_id": device_id,
+        "usuario_id": usuario_id,
+        "action": acao,
+        "payload": payload or {},
+        "status": "pending",
+        "created_at": datetime.utcnow(),
+        "executed_at": None,
+    }
+
+
+def _enfileirar_start_monitoring(device: dict[str, Any], usuario_id: str) -> Optional[dict[str, Any]]:
+    device_id = str(device.get("device_id") or "").strip()
+    if not device_id:
+        return None
+
+    comando_existente = db["desktop_device_commands"].find_one(
+        {
+            "device_id": device_id,
+            "usuario_id": usuario_id,
+            "action": "START_MONITORING",
+            "status": "pending",
+        }
+    )
+    if comando_existente:
+        return None
+
+    monitoring_state = str(device.get("monitoring_state") or "idle").strip().lower()
+    if monitoring_state == "monitoring" and _esta_online(device.get("last_heartbeat_at")):
+        return None
+
+    comando = _gerar_comando(device_id, usuario_id, "START_MONITORING", {"source": "login"})
+    db["desktop_device_commands"].insert_one(comando)
+    db["desktop_devices"].update_one(
+        {"device_id": device_id, "usuario_id": usuario_id},
+        {
+            "$set": {
+                "desired_state": "monitoring",
+                "monitoring_state": "starting",
+                "last_command_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+            }
+        },
+    )
+    return comando
+
+
+def _rotacionar_token_dispositivo(dispositivo: dict[str, Any]) -> tuple[str, datetime, int]:
+    token_version = int(dispositivo.get("token_version", 0)) + 1
+    token = criar_token_dispositivo(dispositivo["device_id"], dispositivo["usuario_id"], token_version)
+    expira_em = datetime.utcnow() + timedelta(minutes=DEVICE_TOKEN_EXPIRACAO_MINUTOS)
+    db["desktop_devices"].update_one(
+        {"device_id": dispositivo["device_id"], "usuario_id": dispositivo["usuario_id"]},
+        {
+            "$set": {
+                "token_version": token_version,
+                "token_expires_at": expira_em,
+                "updated_at": datetime.utcnow(),
+            }
+        },
+    )
+    return token, expira_em, token_version
+
+
+def _resposta_dispositivo(dispositivo: dict[str, Any], comando_criado: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    payload = _serializar_dispositivo(dispositivo)
+    payload.update(
+        {
+            "device_id": dispositivo.get("device_id"),
+            "agent_version": dispositivo.get("agent_version"),
+            "agent_token": None,
+            "paired_at": _iso_or_none(_to_datetime(dispositivo.get("paired_at"))),
+        }
+    )
+    if comando_criado:
+        payload["pending_command_id"] = comando_criado.get("command_id")
+    return payload
 
 
 def buscar_usuario(usuario_id: str):
@@ -236,6 +431,28 @@ class MensagemChat(BaseModel):
     mensagem: str
 
 
+class DesktopDeviceRegister(BaseModel):
+    device_id: Optional[str] = None
+    device_name: Optional[str] = None
+    hostname: Optional[str] = None
+    machine: Optional[str] = None
+    os_name: Optional[str] = None
+    agent_version: Optional[str] = None
+
+
+class DesktopDeviceHeartbeat(BaseModel):
+    device_id: str
+    agent_version: Optional[str] = None
+    monitoring_state: Optional[str] = None
+    monitoring_active: Optional[bool] = None
+    last_command_id: Optional[str] = None
+
+
+class DesktopDeviceCommandAck(BaseModel):
+    command_id: str
+    result: Optional[dict[str, Any]] = None
+
+
 def gerar_hash_senha(senha: str) -> str:
     """Gera hash da senha usando bcrypt diretamente, garantindo limite de 72 bytes."""
     senha_bytes = senha.encode('utf-8')[:72]
@@ -323,6 +540,11 @@ def login(usuario: UsuarioLogin):
         id_do_usuario = str(usuario_db["_id"])
         token_jwt = criar_token(id_do_usuario)
         tem_rosto = usuario_tem_rosto_cadastrado(id_do_usuario)
+        dispositivo = buscar_dispositivo_do_usuario(id_do_usuario)
+        agente_desktop = _serializar_dispositivo(dispositivo)
+
+        if dispositivo:
+            _enfileirar_start_monitoring(dispositivo, id_do_usuario)
         
         return {
             "mensagem": "Login realizado com sucesso!",
@@ -332,12 +554,227 @@ def login(usuario: UsuarioLogin):
             "role": usuario_db.get("role", "funcionario"),
             "empresa_id": usuario_db.get("empresa_id"),
             "tem_rosto": tem_rosto,
+            "agente_desktop": agente_desktop,
         }
     except HTTPException:
         raise
     except Exception as e:
         print(f"Erro interno no login: {e}")
         raise HTTPException(status_code=500, detail=f"Erro interno no servidor: {str(e)}")
+
+
+@app.post("/desktop/devices/register")
+def registrar_dispositivo_desktop(
+    payload: DesktopDeviceRegister,
+    usuario_id: str = Depends(validar_token),
+):
+    usuario = buscar_usuario(usuario_id)
+    device_id = (payload.device_id or _novo_device_id()).strip()
+    if not device_id:
+        raise HTTPException(status_code=400, detail="device_id inválido.")
+
+    existente = db["desktop_devices"].find_one({"device_id": device_id})
+    if existente and existente.get("usuario_id") != usuario_id:
+        raise HTTPException(status_code=403, detail="Este dispositivo já está pareado com outra conta.")
+
+    agora = datetime.utcnow()
+    token_version = int(existente.get("token_version", 0)) + 1 if existente else 1
+    token_dispositivo = criar_token_dispositivo(device_id, usuario_id, token_version)
+    documento = {
+        "device_id": device_id,
+        "usuario_id": usuario_id,
+        "empresa_id": usuario.get("empresa_id"),
+        "device_name": (payload.device_name or payload.hostname or usuario.get("nome") or "Desktop VERIFIQ").strip(),
+        "hostname": payload.hostname,
+        "machine": payload.machine,
+        "os_name": payload.os_name,
+        "agent_version": payload.agent_version or (existente.get("agent_version") if existente else None),
+        "paired_at": existente.get("paired_at") if existente else agora,
+        "last_heartbeat_at": existente.get("last_heartbeat_at") if existente else None,
+        "last_command_at": existente.get("last_command_at") if existente else None,
+        "monitoring_state": existente.get("monitoring_state") if existente else "idle",
+        "desired_state": existente.get("desired_state") if existente else "idle",
+        "token_version": token_version,
+        "token_expires_at": agora + timedelta(minutes=DEVICE_TOKEN_EXPIRACAO_MINUTOS),
+        "updated_at": agora,
+    }
+
+    db["desktop_devices"].update_one(
+        {"device_id": device_id},
+        {"$set": documento, "$setOnInsert": {"created_at": agora}},
+        upsert=True,
+    )
+    dispositivo = db["desktop_devices"].find_one({"device_id": device_id})
+    if not dispositivo:
+        raise HTTPException(status_code=500, detail="Não foi possível registrar o dispositivo.")
+
+    resposta = _resposta_dispositivo(dispositivo)
+    resposta["agent_token"] = token_dispositivo
+    resposta["token_version"] = token_version
+    resposta["token_expires_em"] = _iso_or_none(documento["token_expires_at"])
+    return resposta
+
+
+@app.post("/desktop/devices/token/renew")
+def renovar_token_dispositivo(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    payload = decodificar_token_dispositivo(credentials.credentials)
+    dispositivo = db["desktop_devices"].find_one({"device_id": payload["device_id"], "usuario_id": payload["usuario_id"]})
+    if not dispositivo:
+        raise HTTPException(status_code=404, detail="Dispositivo não encontrado.")
+
+    novo_token, expira_em, token_version = _rotacionar_token_dispositivo(dispositivo)
+    atualizado = db["desktop_devices"].find_one({"device_id": payload["device_id"], "usuario_id": payload["usuario_id"]})
+    resposta = _resposta_dispositivo(atualizado or dispositivo)
+    resposta["agent_token"] = novo_token
+    resposta["token_version"] = token_version
+    resposta["token_expires_em"] = _iso_or_none(expira_em)
+    return resposta
+
+
+@app.post("/desktop/devices/{device_id}/heartbeat")
+def heartbeat_dispositivo(
+    device_id: str,
+    payload: DesktopDeviceHeartbeat,
+    device_payload: dict[str, Any] = Depends(validar_token_dispositivo),
+):
+    if payload.device_id != device_id or device_payload["device_id"] != device_id:
+        raise HTTPException(status_code=400, detail="device_id inconsistente.")
+
+    dispositivo = db["desktop_devices"].find_one({"device_id": device_id, "usuario_id": device_payload["usuario_id"]})
+    if not dispositivo:
+        raise HTTPException(status_code=404, detail="Dispositivo não encontrado.")
+
+    monitoring_state = str(payload.monitoring_state or dispositivo.get("monitoring_state") or "idle").strip().lower()
+    if payload.monitoring_active is True:
+        monitoring_state = "monitoring"
+    elif payload.monitoring_active is False and monitoring_state == "monitoring":
+        monitoring_state = "idle"
+
+    agora = datetime.utcnow()
+    token = None
+    token_expires_em = dispositivo.get("token_expires_at")
+    token_expira_em = _to_datetime(token_expires_em)
+    if token_expira_em and (token_expira_em - agora).total_seconds() <= 30 * 60:
+        token, token_expires_em, _ = _rotacionar_token_dispositivo(dispositivo)
+
+    db["desktop_devices"].update_one(
+        {"device_id": device_id, "usuario_id": device_payload["usuario_id"]},
+        {
+            "$set": {
+                "agent_version": payload.agent_version or dispositivo.get("agent_version"),
+                "last_heartbeat_at": agora,
+                "monitoring_state": monitoring_state,
+                "updated_at": agora,
+            }
+        },
+    )
+
+    dispositivo_atualizado = db["desktop_devices"].find_one({"device_id": device_id, "usuario_id": device_payload["usuario_id"]})
+    resposta = _resposta_dispositivo(dispositivo_atualizado or dispositivo)
+    resposta["heartbeat_at"] = _iso_or_none(agora)
+    resposta["server_time"] = _iso_or_none(agora)
+    resposta["monitoring_state"] = monitoring_state
+    resposta["last_command_id"] = payload.last_command_id
+    if token:
+        resposta["agent_token"] = token
+        resposta["token_expires_em"] = _iso_or_none(token_expires_em)
+    return resposta
+
+
+@app.get("/desktop/devices/{device_id}/commands")
+def buscar_comandos_dispositivo(
+    device_id: str,
+    after: Optional[str] = None,
+    device_payload: dict[str, Any] = Depends(validar_token_dispositivo),
+):
+    if device_payload["device_id"] != device_id:
+        raise HTTPException(status_code=400, detail="device_id inconsistente.")
+
+    comandos_db = list(
+        db["desktop_device_commands"].find(
+            {"device_id": device_id, "usuario_id": device_payload["usuario_id"], "status": "pending"}
+        ).sort("created_at", 1)
+    )
+    comandos = []
+    for comando in comandos_db:
+        comandos.append(
+            {
+                "command_id": comando.get("command_id"),
+                "id": comando.get("command_id"),
+                "device_id": comando.get("device_id"),
+                "action": comando.get("action"),
+                "payload": comando.get("payload") or {},
+                "status": comando.get("status", "pending"),
+                "created_at": _iso_or_none(_to_datetime(comando.get("created_at"))),
+            }
+        )
+
+    return {"commands": comandos, "after": after, "device_id": device_id}
+
+
+@app.post("/desktop/devices/{device_id}/commands/{command_id}/ack")
+def confirmar_comando_dispositivo(
+    device_id: str,
+    command_id: str,
+    payload: DesktopDeviceCommandAck,
+    device_payload: dict[str, Any] = Depends(validar_token_dispositivo),
+):
+    if device_payload["device_id"] != device_id or payload.command_id != command_id:
+        raise HTTPException(status_code=400, detail="Parâmetros do comando inconsistentes.")
+
+    comando = db["desktop_device_commands"].find_one(
+        {"device_id": device_id, "usuario_id": device_payload["usuario_id"], "command_id": command_id}
+    )
+    if not comando:
+        raise HTTPException(status_code=404, detail="Comando não encontrado.")
+
+    agora = datetime.utcnow()
+    db["desktop_device_commands"].update_one(
+        {"device_id": device_id, "usuario_id": device_payload["usuario_id"], "command_id": command_id},
+        {
+            "$set": {
+                "status": "executed",
+                "executed_at": agora,
+                "result": payload.result or {},
+                "updated_at": agora,
+            }
+        },
+    )
+
+    acao = str(comando.get("action") or "").strip().upper()
+    monitoring_state = str(comando.get("payload", {}).get("monitoring_state") or "").strip().lower()
+    if acao == "START_MONITORING":
+        monitoring_state = "monitoring"
+    elif acao in {"STOP_MONITORING", "PAUSE_MONITORING"}:
+        monitoring_state = "idle"
+
+    if monitoring_state:
+        db["desktop_devices"].update_one(
+            {"device_id": device_id, "usuario_id": device_payload["usuario_id"]},
+            {
+                "$set": {
+                    "monitoring_state": monitoring_state,
+                    "last_command_at": agora,
+                    "updated_at": agora,
+                }
+            },
+        )
+
+    return {
+        "ok": True,
+        "command_id": command_id,
+        "status": "executed",
+        "monitoring_state": monitoring_state or comando.get("payload", {}).get("monitoring_state"),
+        "executed_at": _iso_or_none(agora),
+    }
+
+
+@app.get("/desktop/devices/status")
+def status_dispositivo_web(usuario_id: str = Depends(validar_token)):
+    dispositivo = buscar_dispositivo_do_usuario(usuario_id)
+    return _serializar_dispositivo(dispositivo)
 
 
 @app.get("/empresa/funcionarios")
@@ -403,7 +840,7 @@ def listar_chats(usuario_id: str = Depends(validar_token)):
 
 @app.post("/tarefas")
 def criar_tarefa(tarefa: Tarefa, usuario_id: str = Depends(validar_token)):
-    nova_tarefa = tarefa.model_dump()
+    nova_tarefa = tarefa.model_dump() if hasattr(tarefa, "model_dump") else tarefa.dict()
     nova_tarefa["usuario_id"] = usuario_id
     resultado = db["tarefas"].insert_one(nova_tarefa)
     return {"mensagem": "Tarefa criada!", "id": str(resultado.inserted_id)}
