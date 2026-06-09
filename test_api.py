@@ -5,6 +5,7 @@ Nenhum banco real é necessário para rodar.
 """
 
 import pytest
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 from bson import ObjectId
 from fastapi.testclient import TestClient
@@ -15,6 +16,16 @@ from fastapi.testclient import TestClient
 
 # Cria um db falso completo (cada coleção é um MagicMock)
 mock_db = MagicMock()
+mock_collections: dict[str, MagicMock] = {}
+
+
+def get_mock_collection(name: str) -> MagicMock:
+    if name not in mock_collections:
+        mock_collections[name] = MagicMock(name=f"collection_{name}")
+    return mock_collections[name]
+
+
+mock_db.__getitem__.side_effect = get_mock_collection
 
 import sys
 fake_database_module = MagicMock()
@@ -53,6 +64,31 @@ def usuario_doc(
     }
 
 
+def desktop_device_doc(
+    device_id: str,
+    usuario_id: str,
+    monitoring_state: str = "monitoring",
+    last_heartbeat_at: datetime | None = None,
+):
+    return {
+        "device_id": device_id,
+        "usuario_id": usuario_id,
+        "empresa_id": "empresa123",
+        "device_name": "VERIFIQ Desktop",
+        "hostname": "desktop-local",
+        "machine": "x86_64",
+        "os_name": "Windows",
+        "agent_version": "1.0.0",
+        "paired_at": datetime.utcnow() - timedelta(minutes=5),
+        "last_heartbeat_at": last_heartbeat_at or (datetime.utcnow() - timedelta(seconds=30)),
+        "last_command_at": datetime.utcnow() - timedelta(seconds=20),
+        "monitoring_state": monitoring_state,
+        "desired_state": monitoring_state,
+        "token_version": 1,
+        "token_expires_at": datetime.utcnow() + timedelta(hours=4),
+    }
+
+
 def auth_headers(usuario_id: str) -> dict:
     """Gera o header Authorization com JWT válido."""
     token = criar_token(usuario_id)
@@ -61,7 +97,11 @@ def auth_headers(usuario_id: str) -> dict:
 
 def reset_mock():
     """Reseta todos os mocks entre os testes."""
-    mock_db.reset_mock()
+    mock_db.reset_mock(return_value=True, side_effect=True)
+    for collection in mock_collections.values():
+        collection.reset_mock(return_value=True, side_effect=True)
+    mock_collections.clear()
+    mock_db.__getitem__.side_effect = get_mock_collection
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -246,6 +286,23 @@ class TestLogin:
             r = client.post("/login", json={"email": "a@a.com", "senha": "123"})
             assert r.status_code == 500
 
+    def test_login_enfileira_start_monitoring_quando_dispositivo_pareado(self):
+        uid = make_object_id()
+        doc = usuario_doc(uid)
+        device = desktop_device_doc("device-123", uid, monitoring_state="idle")
+
+        mock_db["usuarios"].find_one.return_value = doc
+        mock_db["rostos_registrados"].find_one.return_value = None
+        mock_db["desktop_devices"].find_one.side_effect = [device, device]
+        mock_db["desktop_device_commands"].find_one.return_value = None
+        mock_db["desktop_device_commands"].insert_one.return_value = MagicMock(inserted_id=ObjectId())
+
+        r = client.post("/login", json={"email": "teste@empresa.com", "senha": "senha123"})
+        assert r.status_code == 200
+        data = r.json()
+        assert data["agente_desktop"]["pareado"] is True
+        assert mock_db["desktop_device_commands"].insert_one.called
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. TAREFAS
@@ -258,6 +315,52 @@ class TestTarefas:
         self.uid = make_object_id()
         self.doc = usuario_doc(self.uid)
         self.headers = auth_headers(self.uid)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. DISPOSITIVOS DESKTOP
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDesktopDevices:
+
+    def setup_method(self):
+        reset_mock()
+        self.uid = make_object_id()
+        self.doc = usuario_doc(self.uid, role="admin")
+        self.headers = auth_headers(self.uid)
+
+    def test_status_dispositivo_sem_pareamento(self):
+        mock_db["desktop_devices"].find_one.return_value = None
+
+        r = client.get("/desktop/devices/status", headers=self.headers)
+        assert r.status_code == 200
+        data = r.json()
+        assert data["pareado"] is False
+        assert data["estado"] == "desconectado"
+
+    def test_registrar_dispositivo_retorna_token(self):
+        device_id = "device-abc"
+        mock_db["usuarios"].find_one.return_value = self.doc
+        mock_db["desktop_devices"].find_one.side_effect = [None, desktop_device_doc(device_id, self.uid)]
+        mock_db["desktop_devices"].update_one.return_value = MagicMock()
+
+        r = client.post(
+            "/desktop/devices/register",
+            json={
+                "device_id": device_id,
+                "device_name": "Desktop Principal",
+                "hostname": "desktop-local",
+                "machine": "x86_64",
+                "os_name": "Windows",
+                "agent_version": "1.2.3",
+            },
+            headers=self.headers,
+        )
+
+        assert r.status_code == 200
+        data = r.json()
+        assert data["device_id"] == device_id
+        assert data["agent_token"]
 
     def _mock_usuario(self):
         mock_db["usuarios"].find_one.return_value = self.doc
